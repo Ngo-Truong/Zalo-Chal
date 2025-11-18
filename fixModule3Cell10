@@ -1,0 +1,251 @@
+# ==================== FIXED QWEN INFERENCE - CELL 10 ====================
+
+def infer_qwen(q, options, scene, labels, ocr, laws, temp):
+    """
+    Suy luận với Qwen - FIXED VERSION
+    
+    Cải tiến:
+    - Rút gọn context (max 400 chars)
+    - Giảm temperature (0.15)
+    - Giới hạn max_new_tokens (25)
+    - Prompt đơn giản hơn
+    - Parse pattern chặt chẽ hơn
+    """
+    
+    # ===== CHECK MODEL =====
+    if not _USE_QWEN_OK or qwen is None or tok is None:
+        import random
+        return random.choice(['A', 'B', 'C', 'D']), "⚠️ Model chưa load"
+    
+    try:
+        # ===== BUILD COMPACT CONTEXT =====
+        ctx_parts = []
+        
+        # 1. Scene (PRIORITY 1 - Max 100 chars)
+        if scene and scene.strip():
+            scene_short = scene[:100].strip()
+            ctx_parts.append(f"Cảnh: {scene_short}")
+        
+        # 2. Temporal (PRIORITY 2 - Only first fact)
+        if temp:
+            ctx_parts.append(f"Thời gian: {temp[0][:50]}")
+        
+        # 3. Labels (Top 3 only)
+        if labels:
+            top_labels = labels[:3]
+            ctx_parts.append(f"Nhãn: {', '.join(top_labels)}")
+        
+        # 4. OCR Numbers (ONLY if question has number keywords)
+        if ocr and any(kw in q.lower() for kw in ['tốc độ', 'km/h', 'số', 'biển']):
+            ocr_nums = [x for x in ocr if re.search(r'\d', x)]
+            if ocr_nums:
+                ctx_parts.append(f"Số: {ocr_nums[0]}")
+        
+        # 5. Laws (ONLY if question mentions law)
+        if laws and any(kw in q.lower() for kw in ['luật', 'quy định', 'phạt']):
+            ctx_parts.append(f"Luật: {laws[0][:80]}")
+        
+        # Combine context - MAX 400 chars
+        context = " | ".join(ctx_parts)[:400]
+        
+        # ===== SIMPLE PROMPT (Qwen-specific format) =====
+        opt_txt = "\n".join(f"{chr(65+i)}. {opt}" for i, opt in enumerate(options))
+        
+        # Qwen loves concise prompts
+        system_msg = "Bạn là trợ lý lái xe. Trả lời ĐÚNG format: chữ cái A/B/C/D, xuống dòng, lý do ngắn."
+        
+        user_msg = (
+            f"Câu hỏi: {q}\n\n"
+            f"Đáp án:\n{opt_txt}\n\n"
+            f"Thông tin: {context}\n\n"
+            "Trả lời (chỉ 1 chữ cái, xuống dòng, lý do):\n"
+        )
+        
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg}
+        ]
+        
+        # ===== APPLY CHAT TEMPLATE =====
+        prompt = tok.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # ===== TOKENIZE (Max 800 tokens) =====
+        inp = tok(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=800  # Giảm từ 1024
+        ).to(qwen.device)
+        
+        prompt_len = inp.input_ids.shape[1]
+        
+        # ===== GENERATE (STRICTER PARAMS) =====
+        with torch.no_grad():
+            out = qwen.generate(
+                **inp,
+                max_new_tokens=25,       # Giảm từ 80 → 25
+                do_sample=True,
+                temperature=0.15,        # Giảm từ 0.3 → 0.15
+                top_p=0.9,               # Tăng từ 0.85 → 0.9 (focus hơn)
+                top_k=20,                # Giảm từ 40 → 20
+                pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                eos_token_id=tok.eos_token_id,
+                repetition_penalty=1.05  # Giảm từ 1.1
+            )
+        
+        # ===== DECODE =====
+        gen_tokens = out[0][prompt_len:]
+        response = tok.decode(gen_tokens, skip_special_tokens=True).strip()
+        
+        # ===== CLEANUP =====
+        del out, inp, gen_tokens
+        torch.cuda.empty_cache()
+        
+        # ===== ENHANCED PARSING (9 PATTERNS) =====
+        if response:
+            lines = [l.strip() for l in response.split('\n') if l.strip()]
+            
+            # Patterns từ chặt → lỏng
+            patterns = [
+                r"^([ABCD])\s*$",                          # "A"
+                r"^([ABCD])\s*[\.\:\-\)]",                 # "A." "A:" "A-"
+                r"^([ABCD])\s*\n",                         # "A\n"
+                r"^đáp\s*án[:\s]*([ABCD])\b",              # "Đáp án A"
+                r"^chọn[:\s]*([ABCD])\b",                  # "Chọn A"
+                r"^câu\s*trả\s*lời[:\s]*([ABCD])\b",       # "Câu trả lời: A"
+                r"\(([ABCD])\)",                           # "(A)"
+                r"^([ABCD])\s+[^\n]{5,}",                  # "A Lý do..."
+                r"\b([ABCD])\b"                            # Fallback: any "A"
+            ]
+            
+            # Search in first 2 lines only
+            for line in lines[:2]:
+                for pattern in patterns:
+                    match = re.search(pattern, line, re.IGNORECASE)
+                    if match:
+                        ans_letter = match.group(1).upper()
+                        ans_idx = ord(ans_letter) - 65
+                        
+                        # Validate
+                        if 0 <= ans_idx < len(options):
+                            # Extract explanation
+                            expl_lines = [l for l in lines[1:3] 
+                                         if l and not re.match(r'^[ABCD]\s*[\.\:\-\)]?\s*$', l)]
+                            expl = " ".join(expl_lines[:1]) if expl_lines else f"Chọn {ans_letter}"
+                            
+                            return ans_letter, expl[:150]
+        
+        # ===== RETRY WITH ULTRA-SIMPLE PROMPT =====
+        print(f"⚠️ Parse failed ('{response[:50]}...'), retry ultra-simple...")
+        
+        simple_prompt = f"{q}\n\n{opt_txt}\n\nChỉ trả lời 1 chữ cái A, B, C hoặc D:"
+        
+        inp2 = tok(
+            simple_prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=400  # Rất ngắn
+        ).to(qwen.device)
+        
+        prompt_len2 = inp2.input_ids.shape[1]
+        
+        with torch.no_grad():
+            out2 = qwen.generate(
+                **inp2,
+                max_new_tokens=3,      # Chỉ cho phép "A\n"
+                do_sample=False,       # Greedy = stable nhất
+                temperature=0.1,       # Cực thấp
+                pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                eos_token_id=tok.eos_token_id
+            )
+        
+        gen_tokens2 = out2[0][prompt_len2:]
+        response2 = tok.decode(gen_tokens2, skip_special_tokens=True).strip()
+        
+        del out2, inp2, gen_tokens2
+        torch.cuda.empty_cache()
+        
+        # Parse retry
+        match2 = re.search(r'\b([ABCD])\b', response2, re.IGNORECASE)
+        if match2:
+            ans2 = match2.group(1).upper()
+            if 0 <= ord(ans2) - 65 < len(options):
+                return ans2, "✅ Retry thành công"
+        
+        # ===== FINAL FALLBACK: HEURISTIC =====
+        print(f"⚠️ Retry failed ('{response2}'), using heuristic...")
+        
+        # Heuristic: Chọn đáp án dài nhất (thường đúng trong MCQ)
+        longest_idx = max(range(len(options)), key=lambda i: len(options[i]))
+        longest_letter = chr(65 + longest_idx)
+        
+        return longest_letter, "⚠️ Heuristic: chọn đáp án chi tiết nhất"
+        
+    except torch.cuda.OutOfMemoryError:
+        print("❌ OOM!")
+        torch.cuda.empty_cache()
+        gc.collect()
+        import random
+        return random.choice(['A', 'B', 'C', 'D']), "❌ OOM"
+        
+    except Exception as e:
+        print(f"❌ Error: {str(e)[:100]}")
+        torch.cuda.empty_cache()
+        import random
+        return random.choice(['A', 'B', 'C', 'D']), f"❌ {str(e)[:80]}"
+
+
+print("✅ Fixed Qwen inference loaded")
+
+
+# ===== TEST FUNCTION =====
+def test_qwen_parsing():
+    """Test parsing với nhiều format output"""
+    
+    test_cases = [
+        "A\nĐèn đỏ phải dừng",
+        "A. Dừng lại theo luật",
+        "Đáp án: A\nVì an toàn",
+        "Chọn A",
+        "(A) Dừng xe",
+        "A Theo quy định phải dừng",
+        "Câu trả lời là A",
+        "B",
+        "Tôi nghĩ nên chọn C vì..."
+    ]
+    
+    print("\n🧪 TESTING PARSING:")
+    for i, resp in enumerate(test_cases, 1):
+        lines = [l.strip() for l in resp.split('\n') if l.strip()]
+        
+        patterns = [
+            r"^([ABCD])\s*$",
+            r"^([ABCD])\s*[\.\:\-\)]",
+            r"^đáp\s*án[:\s]*([ABCD])\b",
+            r"^chọn[:\s]*([ABCD])\b",
+            r"\(([ABCD])\)",
+            r"^([ABCD])\s+[^\n]{5,}",
+            r"\b([ABCD])\b"
+        ]
+        
+        found = False
+        for line in lines[:2]:
+            for pattern in patterns:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    ans = match.group(1).upper()
+                    print(f"   {i}. '{resp[:30]}...' → {ans} ✅")
+                    found = True
+                    break
+            if found:
+                break
+        
+        if not found:
+            print(f"   {i}. '{resp[:30]}...' → ❌ FAILED")
+
+# Uncomment để test:
+# test_qwen_parsing()
