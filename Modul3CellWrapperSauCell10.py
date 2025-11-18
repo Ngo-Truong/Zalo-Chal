@@ -23,27 +23,51 @@ def infer_phi(q, options, scene, labels, ocr, laws, temp):
         (answer_letter, explanation)
     """
     
-    # ===== CHECK 1: Qwen có sẵn sàng không? =====
-    qwen_ready = (
-        '_USE_QWEN_OK' in globals() and 
-        _USE_QWEN_OK and 
-        'qwen' in globals() and 
-        qwen is not None and
-        'tok' in globals() and
-        tok is not None
-    )
-    
-    if qwen_ready:
-        # Dùng Qwen
-        try:
-            return infer_qwen(q, options, scene, labels, ocr, laws, temp)
-        except Exception as e:
-            print(f"⚠️ Qwen failed: {str(e)[:80]}, fallback to rules")
-            # Nếu Qwen lỗi → fallback
+    # ===== CHECK 1: Kiểm tra biến globals =====
+    try:
+        # Lấy giá trị từ globals() an toàn
+        use_qwen_ok = globals().get('_USE_QWEN_OK', False)
+        qwen_model = globals().get('qwen', None)
+        qwen_tok = globals().get('tok', None)
+        infer_func = globals().get('infer_qwen', None)
+        
+        # Check tất cả điều kiện
+        qwen_ready = (
+            use_qwen_ok is True and
+            qwen_model is not None and
+            qwen_tok is not None and
+            infer_func is not None and
+            callable(infer_func)
+        )
+        
+        if qwen_ready:
+            # Dùng Qwen
+            try:
+                return infer_qwen(q, options, scene, labels, ocr, laws, temp)
+            except Exception as e:
+                print(f"⚠️ Qwen inference failed: {str(e)[:80]}")
+                print("   Fallback to rule-based...")
+                return rule_based_inference(q, options, scene, labels, ocr, laws, temp)
+        else:
+            # Debug: In ra lý do
+            reasons = []
+            if not use_qwen_ok:
+                reasons.append("_USE_QWEN_OK=False")
+            if qwen_model is None:
+                reasons.append("qwen model not loaded")
+            if qwen_tok is None:
+                reasons.append("tokenizer not loaded")
+            if infer_func is None:
+                reasons.append("infer_qwen() not defined")
+            
+            print(f"⚠️ Qwen not available: {', '.join(reasons)}")
+            print("   Using rule-based inference...")
             return rule_based_inference(q, options, scene, labels, ocr, laws, temp)
-    else:
-        # Không có Qwen → dùng rules
-        print("⚠️ Qwen not available, using rule-based")
+            
+    except Exception as e:
+        # Nếu có lỗi bất ngờ → fallback an toàn
+        print(f"⚠️ Wrapper error: {str(e)[:80]}")
+        print("   Using rule-based inference...")
         return rule_based_inference(q, options, scene, labels, ocr, laws, temp)
 
 
